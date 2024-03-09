@@ -11,6 +11,8 @@ using System.Linq;
 using System.Threading.Tasks;
 using System.Timers;
 using VRage.Game;
+using VRage.Game.ModAPI;
+using VRage.Network;
 
 namespace QuantumHangar
 {
@@ -60,7 +62,7 @@ namespace QuantumHangar
 
 
             var exportPlayerIdentities = new List<long>();
-
+            var playersOfflineDays = new Dictionary<long, int>();
             try
             {
                 //Scan all the identities we need
@@ -77,14 +79,17 @@ namespace QuantumHangar
                     var steamId = MySession.Static.Players.TryGetSteamId(identity.IdentityId);
                     if (steamId == 0)
                         continue;
+                    int lowestValue = Math.Min(Config.AutoHangarDayAmountStation, Math.Min(Config.AutoHangarDayAmountLargeGrid, Config.AutoHangarDayAmountSmallGrid));
+                    var lowest = Config.AutoHangarGridsByType ? lowestValue : Config.AutoHangarDayAmount;
 
                     switch (saveAll)
                     {
                         //Need to see if we need to check this identity
                         case true:
-                        case false when lastLogin.AddDays(Config.AutoHangarDayAmount) < DateTime.Now &&
-                                        !Config.AutoHangarPlayerBlacklist.Any(x => x.SteamId == steamId):
+                        case false when lastLogin.AddDays(lowest) < DateTime.Now &&
+                                    !Config.AutoHangarPlayerBlacklist.Any(x => x.SteamId == steamId):
                             exportPlayerIdentities.Add(identity.IdentityId);
+                            playersOfflineDays[identity.IdentityId] = (int)(DateTime.Now - lastLogin).TotalDays;
                             break;
                     }
                 }
@@ -100,45 +105,80 @@ namespace QuantumHangar
                     if (group.Nodes.Count == 0)
                         continue;
 
-                    var totalBlocks = 0;
                     var grids = new List<MyCubeGrid>();
                     foreach (var grid in group.Nodes.Select(groupNodes => groupNodes.NodeData).Where(grid => grid != null && !grid.MarkedForClose && !grid.MarkedAsTrash))
                     {
-                        totalBlocks += grid.BlocksCount;
+                        var owner = GridUtilities.GetBiggestOwner(grid);
+                        if (!exportPlayerIdentities.Contains(owner))
+                        {
+                            continue;
+                        }
+
                         grids.Add(grid);
                     }
 
-                    //Dont add if this grid group is null/empty
-                    if (grids.Count == 0)
-                        continue;
+                    var ByPlayer = new Dictionary<long, List<MyCubeGrid>>();
 
-                    //Get biggest grid owner, and see if they are an identity that we need to export
-                    grids.BiggestGrid(out var largestGrid);
-                    var biggestOwner = largestGrid.GetBiggestOwner();
-
-                    //No need to autohangar if the largest owner is an NPC
-                    if (MySession.Static.Players.IdentityIsNpc(biggestOwner))
-                        continue;
-
-                    switch (largestGrid.GridSizeEnum)
+                    foreach (var grid in grids)
                     {
-                        //Now see if we should hangar this shit
-                        case MyCubeSize.Large when largestGrid.IsStatic && !hangarStatic:
-                        case MyCubeSize.Large when !largestGrid.IsStatic && !hangarLarge:
-                        case MyCubeSize.Small when !hangarSmall:
-                            continue;
+                        var owner = GridUtilities.GetBiggestOwner(grid);
+
+                        if (ByPlayer.TryGetValue(owner, out var items))
+                        {
+                            items.Add(grid);
+                        }
+                        else
+                        {
+                            ByPlayer.Add(owner, new List<MyCubeGrid>() { grid });
+                        }
                     }
 
+                    foreach (var gridList in ByPlayer)
+                    {
+                        if (!exportPlayerIdentities.Contains(gridList.Key)) continue;
+                        var totalBlocks = 0;
+                        //Dont add if this grid group is null/empty
+                        if (gridList.Value.Count == 0)
+                            continue;
 
-                    //Add this new grid into our planned export queue
-                    if (!exportPlayerIdentities.Contains(biggestOwner)) continue;
-                    var hangar = new AutoHangarItem(totalBlocks, grids, largestGrid);
-                    if (!scannedGrids.ContainsKey(biggestOwner))
-                        scannedGrids.Add(biggestOwner, new List<AutoHangarItem>() { hangar });
-                    else
-                        scannedGrids[biggestOwner].Add(hangar);
+                        totalBlocks += gridList.Value.Select(x => x.BlocksCount).Sum();
+                        //Get biggest grid owner, and see if they are an identity that we need to export
+                        gridList.Value.BiggestGrid(out var largestGrid);
+                        //No need to autohangar if the largest owner is an NPC
+                        if (MySession.Static.Players.IdentityIsNpc(gridList.Key))
+                            continue;
+                        var exportedGrids = new List<MyCubeGrid>();
+
+                        var staticDays = Config.AutoHangarGridsByType ? Config.AutoHangarDayAmountStation : Config.AutoHangarDayAmount;
+                        var largeDays = Config.AutoHangarGridsByType ? Config.AutoHangarDayAmountLargeGrid : Config.AutoHangarDayAmount;
+                        var smallDays = Config.AutoHangarGridsByType ? Config.AutoHangarDayAmountSmallGrid : Config.AutoHangarDayAmount;
+
+                        if (hangarStatic && playersOfflineDays[gridList.Key] >= staticDays)
+                        {
+                            exportedGrids.AddRange(gridList.Value.Where(x => x.GridSizeEnum == MyCubeSize.Large && x.IsStatic).ToList());
+                        }
+                        if (hangarLarge && playersOfflineDays[gridList.Key] >= largeDays)
+                        {
+                            exportedGrids.AddRange(gridList.Value.Where(x => x.GridSizeEnum == MyCubeSize.Large && !x.IsStatic).ToList());
+                        }
+                        if (hangarSmall && playersOfflineDays[gridList.Key] >= smallDays)
+                        {
+                            exportedGrids.AddRange(gridList.Value.Where(x => x.GridSizeEnum == MyCubeSize.Small).ToList());
+                        }
+
+                        if (!exportedGrids.Any())
+                        {
+                            continue;
+                        }
+                        //Add this new grid into our planned export queue
+
+                        var hangar = new AutoHangarItem(totalBlocks, exportedGrids, largestGrid);
+                        if (!scannedGrids.ContainsKey(gridList.Key))
+                            scannedGrids.Add(gridList.Key, new List<AutoHangarItem>() { hangar });
+                        else
+                            scannedGrids[gridList.Key].Add(hangar);
+                    }
                 }
-
 
                 Task.Run(() => SaveAutoHangarGrids(scannedGrids));
             }
