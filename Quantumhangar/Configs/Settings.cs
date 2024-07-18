@@ -24,6 +24,9 @@ namespace QuantumHangar
         private double _gridDistanceCheck;
         public double GridDistanceCheck { get => _gridDistanceCheck; set => SetValue(ref _gridDistanceCheck, value); }
 
+        private double _npcGridDistanceCheck;
+        public double NpcGridDistanceCheck { get => _npcGridDistanceCheck; set => SetValue(ref _npcGridDistanceCheck, value); }
+
         private int _gridCheckMinBlock = 25;
         public int GridCheckMinBlock { get => _gridCheckMinBlock; set => SetValue(ref _gridCheckMinBlock, value); }
 
