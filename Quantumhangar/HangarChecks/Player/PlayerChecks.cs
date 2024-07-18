@@ -565,11 +565,11 @@ namespace QuantumHangar.HangarChecks
         {
             if (loadingAtSavePoint == LoadType.ForceLoadMearPlayer) position = _playerPosition;
 
-            var playersFaction = MySession.Static.Factions.GetPlayerFaction(_identityId);
+            MyFaction playersFaction = MySession.Static.Factions.GetPlayerFaction(_identityId);
             var enemyFoundFlag = false;
 
-
             if (Config.DistanceCheck > 0)
+            {
                 //Check enemy location! If under limit return!
                 foreach (var p in MySession.Static.Players.GetOnlinePlayers())
                 {
@@ -609,78 +609,91 @@ namespace QuantumHangar.HangarChecks
                     }
 
 
-                    if (Vector3D.Distance(position, pos) == 0) continue;
+                    if (Vector3D.Distance(position, pos) == 0)
+                        continue;
+                    if (Vector3D.Distance(position, pos) > Config.DistanceCheck)
+                        continue;
 
-                    if (!(Vector3D.Distance(position, pos) <= Config.DistanceCheck)) continue;
                     _chat?.Respond("Unable to load grid! Enemy within " + Config.DistanceCheck + "m!");
                     _gpsSender.SendGps(position, "Failed Hangar Load! (Enemy nearby)", _identityId);
-                    enemyFoundFlag = true;
-                    break;
-                }
-
-
-            if (!(Config.GridDistanceCheck > 0) || Config.GridCheckMinBlock <= 0 || enemyFoundFlag != false)
-                return !enemyFoundFlag;
-            {
-                var spawnSphere = new BoundingSphereD(position, Config.GridDistanceCheck);
-
-                var entities = new List<MyEntity>();
-                MyGamePruningStructure.GetAllTopMostEntitiesInSphere(ref spawnSphere, entities);
-
-
-                //This is looping through all grids in the specified range. If we find an enemy, we need to break and return/deny spawning
-                foreach (var grid in entities.OfType<MyCubeGrid>())
-                {
-                    if (grid == null || grid.MarkedForClose)
-                        continue;
-
-                    if (grid.BigOwners.Count <= 0 || grid.CubeBlocks.Count < Config.GridCheckMinBlock)
-                        continue;
-
-                    if (grid.BigOwners.Contains(_identityId))
-                        continue;
-
-
-                    //if the player isnt big owner, we need to scan for faction mates
-                    var foundAlly = true;
-                    foreach (var targetPlayerFaction in grid.BigOwners.Select(owner => MySession.Static.Factions.GetPlayerFaction(owner)))
-                    {
-                        if (playersFaction != null && targetPlayerFaction != null)
-                        {
-                            if (playersFaction.FactionId == targetPlayerFaction.FactionId)
-                                continue;
-
-                            var relation = MySession.Static.Factions
-                                .GetRelationBetweenFactions(playersFaction.FactionId, targetPlayerFaction.FactionId)
-                                .Item1;
-                            if (relation != MyRelationsBetweenFactions.Enemies) continue;
-                            foundAlly = false;
-                            break;
-                        }
-                        else
-                        {
-                            foundAlly = false;
-                            break;
-                        }
-                    }
-
-                    if (foundAlly) continue;
-                    //Stop loop
-                    _chat?.Respond("Unable to load grid! Enemy within " + Config.GridDistanceCheck + "m!");
-                    _gpsSender.SendGps(position, "Failed Hangar Load! (Enemy nearby)", _identityId);
-                    enemyFoundFlag = true;
-                    break;
+                    return false; // Enemy found, distance check fails
                 }
             }
 
-            return !enemyFoundFlag;
+            // No grid check if min blocks not configured
+            if (Config.GridCheckMinBlock <= 0)
+                return true;
+
+            // If no grid distance check is not configured then fuck off
+            bool enableMinBlockCheck = (Config.GridCheckMinBlock > 0);
+            bool enableGridDistanceCheck = (Config.GridDistanceCheck > 0);
+            if (!enableGridDistanceCheck && (Config.NpcGridDistanceCheck <= 0))
+                return true;
+
+            // Default NPC grid distance to regular grid distance if not configured
+            double npcGridDistanceCheck = Config.NpcGridDistanceCheck;
+            if (npcGridDistanceCheck <= 0)
+                npcGridDistanceCheck = Config.GridDistanceCheck;
+
+            // Locate entities
+            BoundingSphereD gridCheckSphere = new BoundingSphereD(position, Config.GridDistanceCheck);
+            BoundingSphereD npcCheckSphere = new BoundingSphereD(position, npcGridDistanceCheck);
+            BoundingSphereD largestCheckSphere = new BoundingSphereD(position, Math.Max(Config.GridDistanceCheck, npcGridDistanceCheck));
+            List<MyEntity> foundEntities = new List<MyEntity>();
+            MyGamePruningStructure.GetAllTopMostEntitiesInSphere(ref largestCheckSphere, foundEntities);
+
+            // Look for any grids that would be considered an "enemy grid" that is within range
+            foreach (MyCubeGrid grid in foundEntities.OfType<MyCubeGrid>())
+            {
+                if ((grid == null) || grid.MarkedForClose || (grid.BigOwners.Count <= 0) || (grid.BigOwners.Contains(_identityId)))
+                    continue;
+
+                if (enableMinBlockCheck && grid.CubeBlocks.Count < Config.GridCheckMinBlock)
+                    continue;
+
+                // Get factions for all owners - Determine if grid contains any enemies of the current player
+                List<MyFaction> ownerFactions = grid.BigOwners
+                    .Select(owner => MySession.Static.Factions.GetPlayerFaction(owner))
+                    .Distinct()
+                    .ToList();
+                bool gridContainsEnemies = (playersFaction == null)
+                    || ownerFactions.Contains(null)
+                    || ownerFactions.Any(f => (f.FactionId != playersFaction.FactionId) && (MySession.Static.Factions.GetRelationBetweenFactions(playersFaction.FactionId, f.FactionId).Item1 == MyRelationsBetweenFactions.Enemies));
+
+                // Only interested in doing distance checks when grids contain enemies
+                if (gridContainsEnemies)
+                {
+                    bool intersects;
+                    if (ownerFactions.Exists(faction => faction?.IsEveryoneNpc() == true))
+                    {
+                        // NPC grid distance check
+                        intersects = (npcGridDistanceCheck > Config.GridDistanceCheck) || npcCheckSphere.Intersects(grid.GetPhysicalGroupAABB());
+                    }
+                    else if (enableGridDistanceCheck)
+                    {
+                        // Must use the smaller grid sphere, if the grid distance is smaller than the npc grid distance
+                        intersects = (Config.GridDistanceCheck > npcGridDistanceCheck) || gridCheckSphere.Intersects(grid.GetPhysicalGroupAABB());
+                    }
+                    else
+                    {
+                        // Grid is not NPC grid, player grid distance checks are disabled
+                        intersects = false;
+                    }
+
+                    if (intersects)
+                    {
+                        _chat?.Respond("Unable to load grid! Enemy within " + Config.GridDistanceCheck + "m!");
+                        _gpsSender.SendGps(position, "Failed Hangar Load! (Enemy nearby)", _identityId);
+                        return false;
+                    }
+                }
+            }
+
+            return true;
         }
 
-        private static Vector3D DetermineSpawnPosition(Vector3D gridPosition, Vector3D characterPosition,
-            out bool keepOriginalPosition, bool playersSpawnNearPlayer = false)
+        private static Vector3D DetermineSpawnPosition(Vector3D gridPosition, Vector3D characterPosition, out bool keepOriginalPosition, bool playersSpawnNearPlayer = false)
         {
-
-       
             switch (Config.LoadType)
             {
                 //If the ship is loading from where it saved, we want to ignore aligning to gravity. (Needs to attempt to spawn in original position)
